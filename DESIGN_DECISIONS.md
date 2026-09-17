@@ -432,3 +432,37 @@ raw error.
 **Status:** Decided. Not yet implemented.
 
 ---
+
+## 9. Supporting entities — `User.role`, `AssetType`, `MaintenanceRecord.status`
+
+**`User.role` — enum + CHECK, same pattern as `AssetStatus` (Decision 2):**
+Roles (`ADMIN`, `MANAGER`, `EMPLOYEE`) are tightly coupled to the permission
+matrix defined in code (Section 6) — adding a new role always requires a
+corresponding code change to actually grant it meaning, unlike
+`LocationType`/`AssetType` which can be extended with a plain data insert.
+Same reasoning as `AssetStatus`: enum on the Java side, `CHECK` constraint
+on the DB column for defense against writes that bypass the application.
+
+**`AssetType` — global lookup table, not organization-scoped:**
+Unlike `Location`/`Asset`/`Assignment` (Decision 5), `AssetType` is a
+**global, shared lookup table with no `organizationId`**, following the
+same pattern as `LocationType` (Decision 4). The distinguishing question
+from the IDOR risk in Decision 5: Decision 5 protects against a user
+accessing another organization's *specific data records*. Here, the concern
+is different — knowing that a category like "Laptop" *exists* as a type is
+not sensitive information, comparable to how any organization can see the
+full set of `AssetStatus` values without that being a data leak. Making
+`AssetType` organization-scoped would additionally force every organization
+wanting a "Laptop" type to create its own duplicate row, instead of sharing
+one global definition.
+
+**`MaintenanceRecord.status` — enum + CHECK, but simple ordinal comparison
+instead of a transition map:**
+The `Reported → IN_PROGRESS → COMPLETED` lifecycle is strictly linear (no
+branching, unlike `AssetStatus`), so a full `Map<Status, Set<Status>>`
+transition table (Decision 2) would be unnecessary complexity for this
+entity. A simple forward-only check (e.g. comparing enum ordinals, rejecting
+any transition that would move backward) is sufficient. Still backed by a
+DB-level `CHECK` constraint on valid values, same as any other status enum.
+
+**Status:** Decided. Not yet implemented.
