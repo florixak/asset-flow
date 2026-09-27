@@ -322,6 +322,35 @@ links/emails and expect to be immediately authenticated — for that use case,
 prioritizing CSRF protection over that convenience is the right trade-off.
 `Secure` ensures the cookie is only ever transmitted over HTTPS.
 
+**Refresh token persistence — a database table, not another stateless JWT:**
+Unlike the short-lived access token, the refresh token has a much longer
+lifetime (days/weeks), so it needs a way to be revoked before its natural
+expiration — e.g. on logout, or when an admin disables a user's account.
+This requires a persistent `refresh_token` table:
+
+```
+REFRESH_TOKENS { id, user_id, organization_id, token_hash, revoked, expires_at, created_at }
+```
+
+**Why `token_hash`, not the raw token value:** storing the raw refresh
+token would mean that anyone who gains read access to this table (an
+attacker, or even just database access) could impersonate any user by
+presenting their stored token directly — no decryption needed. Instead, a
+deterministic hash (e.g. SHA-256) of the token is stored; verifying an
+incoming token means hashing it the same way and comparing against the
+stored hash, without ever needing to store or recover the original value.
+SHA-256 (fast) is appropriate here — unlike password hashing (BCrypt/Argon2,
+deliberately slow to resist brute-force), a refresh token is a
+high-entropy, randomly generated value, not a human-chosen secret, so
+brute-force resistance via slow hashing is not the relevant concern.
+
+**Per-device session metadata (`ip_address`, `user_agent`) — considered and
+explicitly excluded from scope:** enabling a "manage your active devices,
+sign out a specific device" UI is a legitimate feature, but was deliberately
+left out as feature-creep relative to this project's stated depth-over-breadth
+goal (Section 20) — it doesn't reinforce the core skills (Spring Security,
+JPA, REST API design) this project exists to demonstrate.
+
 **Status:** Decided. Not yet implemented.
 
 ---
@@ -464,5 +493,303 @@ transition table (Decision 2) would be unnecessary complexity for this
 entity. A simple forward-only check (e.g. comparing enum ordinals, rejecting
 any transition that would move backward) is sufficient. Still backed by a
 DB-level `CHECK` constraint on valid values, same as any other status enum.
+
+**Status:** Decided. Not yet implemented.
+
+## 10. `Asset.locationId` — nullable
+
+**Decision:** `Asset.locationId` is nullable. An asset can exist in the
+system (tracked, evidenced) before being physically assigned to a location —
+e.g. newly received inventory awaiting placement. Not a diagram default;
+deliberately chosen to reflect a real intermediate state in the asset
+lifecycle.
+
+**Status:** Decided. Not yet implemented.
+
+## 11. API response shape — custom paged DTO, no wrapper on single-resource responses
+
+**Decision:**
+- **List/paginated endpoints** (e.g. `GET /api/v1/assets`) return a custom
+  `PagedResponse<T>` DTO — `{ "data": [...], "meta": { totalElements,
+  totalPages, number, size } }` — rather than serializing Spring Data's
+  `Page<T>` directly.
+- **Single-resource endpoints** (e.g. `GET /api/v1/assets/{id}`) return the
+  resource object directly, with no wrapping envelope.
+
+**Why not serialize `Page<T>` directly:**
+`Page<T>`'s JSON shape is a Spring Data framework implementation detail, not
+a contract owned by this API. Serializing it directly ties the API's public
+response shape to whatever Spring Data JPA happens to produce in a given
+version — a framework upgrade changing that internal shape would silently
+break frontend clients relying on it. Defining an owned `PagedResponse<T>`
+DTO, populated from `Page<T>` internally, keeps the public contract stable
+and independent of the persistence framework's version.
+
+**Why not a `{ "data": ... }` wrapper on single-resource responses:**
+Considered wrapping every response (list or single) in the same `data`
+envelope for structural consistency, but rejected: a TypeScript/frontend
+client already knows, from which endpoint it called, whether to expect a
+single object or a list — the wrapper adds no information the client
+doesn't already have from context, so it would be a cosmetic-only envelope
+with no practical benefit. Reserved the envelope specifically for where it
+carries real, necessary information (pagination metadata).
+
+**Status:** Decided. Not yet implemented.
+
+## 12. Dynamic filtering — `JpaSpecificationExecutor`, entity-owned Specifications
+
+**Decision:** `AssetRepository extends JpaSpecificationExecutor<Asset>`, with
+a dedicated `AssetSpecifications` utility class (static methods like
+`hasStatus(...)`, `hasType(...)`, `hasLocation(...)`, `nameContains(...)`
+returning `Specification<Asset>`) composed at the service layer via
+`Specification.where(...).and(...)` based on which query parameters were
+actually supplied.
+
+**Why not a single repository method with every filter as a parameter:**
+A method like `findByStatusAndAssetTypeAndLocationAndNameContaining(...)`
+cannot represent "any subset of filters, in any combination, some possibly
+absent" — Spring Data derived query methods require every parameter to be
+supplied. Specifications are composed dynamically at runtime, only adding a
+`WHERE` predicate for filters the caller actually provided.
+
+**Where `AssetSpecifications` lives:** inside the `asset` package, not
+`common/` — the filtering logic operates on `Asset`-specific fields and is
+not a generic, reusable tool across other entities, unlike genuinely
+cross-cutting concerns (e.g. `PagedResponse<T>`, Decision 11).
+
+**Status:** Decided. Not yet implemented.
+
+## 13. Global exception handling — HTTP status mapping
+
+**Decision:** A single `@RestControllerAdvice` maps every domain/framework
+exception encountered so far to the Section 9 error contract, with the
+following HTTP status assignments:
+
+| Exception                                  | HTTP Status | Reasoning |
+|---------------------------------------------|:-----------:|-----------|
+| `AssetAlreadyAssignedException`             | 409 Conflict | Conflicts with the *current state* of the resource (asset is already actively assigned). |
+| `InvalidStatusTransitionException`          | 422 Unprocessable Entity | Request is syntactically valid, but semantically not executable given the current business state (illegal lifecycle transition). |
+| `DataIntegrityViolationException`           | 409 Conflict | Mapped uniformly to 409 for simplicity, covering the `Assignment` uniqueness race condition (Decision 1) as the primary expected case. Accepted trade-off: this exception is generic and could in principle be caused by other DB constraint violations (e.g. `NOT NULL`) that might better fit 400 — distinguishing by SQLSTATE/constraint name was considered and deliberately not pursued, as fragile/DB-driver-specific for this project's scope. |
+| `ObjectOptimisticLockingFailureException`   | 409 Conflict | Conflicts with a concurrent write — the resource was modified by another transaction since it was read (textbook definition of 409 per HTTP semantics). |
+
+**Status:** Decided. Not yet implemented.
+
+## 14. `Asset` REST endpoints — request DTO shape, PATCH over PUT, soft delete
+
+**Server-controlled fields excluded from request DTOs:**
+`CreateAssetRequest` (and update DTOs generally) never include `id`,
+`organizationId`, `status`, `version`, `createdAt`/`updatedAt` — fields that
+represent ownership, authorization, or system-managed state must never be
+client-suppliable, and are instead derived from the security context (JWT)
+or set by the server. Allowing `organizationId` in a request body would let
+an authenticated user from one organization create data attributed to a
+*different* organization — a **Mass Assignment vulnerability**: related to,
+but distinct from, IDOR (Decision 5) — IDOR is about referencing/reading an
+existing foreign object by ID, whereas mass assignment is about a client
+injecting an unauthorized value into a field it should never control on a
+new or updated record. General rule applied project-wide: `organizationId`
+always comes from the JWT, never from any request body.
+
+```json
+// CreateAssetRequest
+{
+  "assetTag": "LT-482",
+  "name": "ThinkPad X1",
+  "description": "...",
+  "serialNumber": "...",
+  "assetTypeId": "uuid",
+  "locationId": "uuid | null",
+  "purchaseDate": "2026-01-15",
+  "purchasePrice": 1200.00
+}
+```
+
+**`PATCH`, not `PUT`, for updates:**
+`PUT` semantically means "replace the entire resource" — a field omitted
+from the body is (by REST convention) treated as intentionally cleared.
+This creates real risk: if a client omits a field (e.g. due to a UI bug or
+a form that doesn't include every field), `PUT` semantics would wipe it,
+and the server cannot reliably distinguish "field omitted, keep the old
+value" from "field explicitly set to null" without extra machinery.
+`PATCH` semantics ("apply only the fields present") avoids this class of
+bug by convention: an absent field simply means "leave unchanged," which is
+both simpler to implement and matches this project's own Section 7 API
+sketch.
+
+**Status changes — separate endpoint, not part of general `PATCH`:**
+`status` is deliberately excluded from the general asset-update DTO and
+handled via its own endpoint (`PATCH /api/v1/assets/{id}/status`), so it
+can go through `AssetStatus.canTransitionTo()` validation (Decision 2) and
+be authorized independently from general field edits (matching the
+permission matrix in Section 6, which lists "Delete/retire asset" as a
+distinct permission from "Edit asset").
+
+**`DELETE` — soft delete via existing status transition, not a physical
+row delete:**
+`DELETE /api/v1/assets/{id}` does not issue a SQL `DELETE`. A physical
+delete would either cascade-delete related `AssetHistory`/`Assignment`/
+`MaintenanceRecord` rows (violating the immutable-history requirement,
+Section 5.7) or be blocked outright by `ON DELETE RESTRICT` foreign keys —
+neither is desirable. Instead, `DELETE` transitions the asset to `RETIRED`
+(or `DISPOSED`), reusing the *same* `AssetService.changeStatus()` method
+and transition validation as the general status-change endpoint (single
+source of truth, same principle as Decision 7) — `DELETE` is a thinner,
+semantically-named entry point with a fixed target status and its own
+(stricter) authorization rule, not an independent copy of transition logic.
+Kept as a distinct endpoint from the general status-change endpoint
+specifically because it warrants different authorization (e.g. retiring an
+asset may require a stricter role than general status changes).
+
+**Status:** Decided. Not yet implemented.
+
+## 15. `Assignment` return endpoint — `PATCH`, server-derived `returnedAt`
+
+**Decision:**
+```
+POST  /api/v1/assets/{id}/assignments                      -> create (assign)
+PATCH /api/v1/assets/{id}/assignments/{assignmentId}       -> return
+```
+
+**Why `PATCH`, not `DELETE`, for returning an asset:**
+Unlike `Asset`'s soft-delete (Decision 14), where `DELETE` was justified as
+semantically close to "no longer in active circulation," returning an
+assignment does not conceptually remove or deactivate the record — the row
+remains fully valid and useful as a historical record (who had this asset
+before). This is a partial update of a single field (`returnedAt`) on an
+otherwise-unchanged, still-relevant row — `PATCH` fits the actual semantics
+better than the closer-to-"gone" framing that justified `DELETE` for
+`Asset`.
+
+**`returnedAt` is never accepted from the client:**
+The `PATCH` request body is empty (or carries only genuinely optional,
+non-authoritative fields like a note). `returnedAt` is always set by the
+server to the current time when the request is processed, and `returnedBy`
+is derived from the JWT security context — never accepted as client input.
+Same principle as `organizationId` (Decision 14): any field that is
+security- or integrity-sensitive (timestamps of server-recorded actions,
+ownership, system-managed state) must never be client-suppliable, since a
+client could otherwise backdate or falsify the historical record (e.g.
+claiming an asset was returned earlier than it actually was).
+
+**Status:** Decided. Not yet implemented.
+
+## 16. `AssignmentService.assignAsset()` — validation order
+
+**Decision:** `assignAsset(assetId, userId)` performs checks in this order:
+
+1. **Authorization** — does the caller have permission to assign assets?
+   Performed first, before touching the database at all — rejecting
+   unauthorized requests as early as possible avoids unnecessary DB queries
+   and minimizes any information that could otherwise leak through timing
+   or error responses before an auth check.
+2. **Asset exists and belongs to the caller's organization** —
+   `findByIdAndOrganizationId(assetId, orgId)` (Decision 5), not a plain
+   `findById`.
+3. **Target user exists and belongs to the same organization** — same
+   `findByIdAndOrganizationId` pattern applied to `User`. Without this, a
+   caller could assign an asset to a user belonging to a *different*
+   organization (or, combined with a mismatched asset org, cross-link data
+   across organizations) — the same family of risk as Decision 5/14, applied
+   to a foreign-key reference supplied in the request body rather than a
+   path parameter.
+4. **No existing active assignment** (Decision 1's service-level check) and
+   **asset status permits assignment** (e.g. not `RETIRED`/`DISPOSED`) —
+   these two checks are independent of each other (neither is a logical
+   prerequisite for the other) and their relative order does not affect
+   correctness; both must pass regardless of order.
+5. **Persist** — the new `Assignment` row is inserted, with the DB partial
+   unique index (Decision 1) as the final backstop against a race condition
+   between concurrent requests reaching step 5 simultaneously.
+
+**Status:** Decided. Not yet implemented.
+
+## 17. `Maintenance` REST endpoints — separate named-action endpoints, deferred `cost`
+
+**Decision:**
+```
+POST  /api/v1/maintenance                    -> create (Reported)
+PATCH /api/v1/maintenance/{id}/start         -> Reported -> IN_PROGRESS
+PATCH /api/v1/maintenance/{id}/complete      -> IN_PROGRESS -> COMPLETED
+GET   /api/v1/maintenance                    -> list (filtering/pagination, same pattern as Asset)
+GET   /api/v1/maintenance/{id}               -> detail
+```
+
+**Separate named-action endpoints, not one general `PATCH`:**
+A single `PATCH /maintenance/{id}` accepting an arbitrary status change
+would require internal branching (`if status == IN_PROGRESS ... else if
+status == COMPLETED ...`) — the same kind of branching complexity already
+avoided for `AssetStatus` via an enum-owned transition map instead of a
+`switch` (Decision 2). Separate, explicitly named endpoints avoid this
+structurally, and make each endpoint's responsibility unambiguous.
+
+**`startedAt`/`completedAt` — server-derived, never client-supplied**, same
+principle as `returnedAt` (Decision 15) and `organizationId` (Decision 14):
+timestamps of server-recorded actions must never be trusted from the client.
+
+**`cost` deferred to the `complete` endpoint, not part of creation:**
+The actual repair cost is typically unknown when a maintenance issue is
+first reported, and only becomes meaningful once work is completed. `cost`
+is therefore part of `CompleteMaintenanceRequest`, not
+`CreateMaintenanceRequest`.
+
+```json
+// CreateMaintenanceRequest
+{ "assetId": "uuid", "title": "...", "description": "...", "priority": "MEDIUM", "assignedTo": "uuid | null" }
+// StartMaintenanceRequest -> empty body
+// CompleteMaintenanceRequest
+{ "cost": 240.00 }
+```
+
+**`startMaintenance()` validation order:** organization ownership check of
+the `MaintenanceRecord` (`findByIdAndOrganizationId`) is performed first,
+alongside authorization, before any other logic — same reasoning as
+Decision 16 (reject early, avoid unnecessary work). `MaintenanceService`
+does not duplicate `AssetStatus` transition validation; it relies entirely
+on `AssetService.changeStatus()` throwing `InvalidStatusTransitionException`
+if the asset is not in a state that legally permits `IN_MAINTENANCE` —
+consistent with the single-source-of-truth principle established in
+Decision 7.
+
+**Status:** Decided. Not yet implemented.
+
+## 18. `Location` and `User` endpoints — applying established patterns
+
+**`Location`:**
+```
+POST   /api/v1/locations
+PATCH  /api/v1/locations/{id}
+GET    /api/v1/locations   (?tree=true for hierarchical view)
+GET    /api/v1/locations/{id}
+DELETE /api/v1/locations/{id}
+```
+- Validation order for create/patch: authorization + organization ownership
+  first; if `parentId` is being changed, run the cycle-detection recursive
+  CTE (Decision 4) before persisting; if a new `parentId` is supplied,
+  verify it belongs to the *same* organization (same cross-org risk family
+  as Decisions 14/16). `Location.organizationId` itself is immutable after
+  creation — a node can be reparented within its own organization's tree,
+  never moved to another organization's tree.
+- `DELETE` performs an actual row delete (unlike `Asset`'s soft delete,
+  Decision 14) but only succeeds if the location has no child locations and
+  no assets referencing it — otherwise `409 Conflict`. Justified because,
+  unlike assets, there is no business need to retain a record that a
+  location "used to exist" once it's empty and childless.
+
+**`User` / auth:**
+```
+POST /api/v1/auth/register     (ADMIN-only — no public self-registration; AssetFlow is an internal tool)
+POST /api/v1/auth/login        -> issues access + refresh tokens as HttpOnly cookies (Decision 6)
+POST /api/v1/auth/refresh      -> new access token, validated via stored token_hash (Decision 6)
+POST /api/v1/auth/logout       -> marks the refresh token `revoked = true`
+PATCH /api/v1/users/{id}
+PATCH /api/v1/users/{id}/role  (ADMIN-only, separate endpoint — same reasoning as Asset.status/DELETE: different, stricter authorization than general profile edits)
+GET  /api/v1/users
+```
+- `password`/`password_hash` is never included in any response DTO —
+  response mappers must explicitly exclude it, since it's easy to forget
+  with auto-generated/reflective mapping.
+- `login`/`refresh`/`logout` are not organization-scoped by URL/JWT context,
+  since no JWT exists yet at that point — `organizationId` is only known
+  after the submitted credentials are verified against the `User` record.
 
 **Status:** Decided. Not yet implemented.
